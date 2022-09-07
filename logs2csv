@@ -1,0 +1,294 @@
+#!/usr/bin/env python3
+# -*- mode: python -*-
+
+from datetime import datetime, timedelta
+import argparse
+import csv
+import io
+import re
+import sys
+
+import htcondor
+
+class DataDictionaryAction(argparse.Action):
+    def __call__(self, parser, namespace, values, option_string=None):
+        print("""
+CSV output column definitions:
+
+JobId      - Job ID, formatted as the Cluster ID, a ".", and the Process ID
+Submitted  - Timestamp when the job was submitted
+ExecCount  - Count of job executions
+EvictCount - Count of job evictions
+TermCount  - Count of job terminations, typically 0 (if not done) or 1 (once done)
+TermNorm   - Count of normal job terminations
+TermAbnorm - Count of abnormal job terminations
+ShdwExcpt  - Count of shadow exceptions, which are HTCondor errors related to the job
+Abrts      - Count of job aborts (when the user canceled the job)
+Suspnds    - Count of job suspensions (often due to interactive use of the Execution Point)
+Unsus      - Count of job unsuspensions (following a suspension)
+Holds      - Count of job holds
+Releases   - Count of job releases from the hold state
+Disconns   - Count of job disconnects, when HTCondor lost communication between the Execution Point and Access Point
+Reconns    - Count of job reconnects, after being disconnected (previous item)
+RecFails   - Count of job reconnect failures, after being disconnected; each failure caused the job to go back to Idle on the Access Point
+FTStarts   - Count of file transfer starts, both input and output file transfers combined
+UsageSum   - Total CPU usage by the job
+ByteSent   - Total bytes sent by job
+ByteRcvd   - Total bytes received by job
+RetVal     - Return value (aka exit code) of the job
+CPUsReq    - The job's request_cpus value
+CPUsAlloc  - The number of CPUs allocated to the job on its final execution
+CPUsUsed   - The number of CPUs that HTCondor measured the job using on its final execution
+DiskReq    - The job's request_disk value (in KB)
+DiskAlloc  - The amount of disk (in KB) allocated to the job on its final execution
+DiskUsed   - The maximum amount of disk (in KB) that HTCondor observed the job using on its final execution
+MemReq     - The job's request_memory value (in MB)
+MemAlloc   - The amount of memory (in MB) allocated to the job on its final execution
+MemUsed    - The maximum amount of memory (in MB) that HTCondor observed the job using across all executions
+ImageSz    - Another measure of the maximum amount of memory (in MB) that HTCondor observed the job using across all executions
+""", file=sys.stderr)
+        sys.exit(0)
+
+class JobInfo:
+    """Simple container for tallied data from a job."""
+
+    def __init__(self, job_id):
+        """Initialize a job object with sensible values."""
+
+        self.job_id = job_id
+        self.submitted = None
+        self.execution_count = 0
+        self.eviction_count = 0
+        self.termination_count = 0
+        self.normal_terminations = 0
+        self.abnormal_terminations = 0
+        self.shadow_exceptions = 0
+        self.aborts = 0
+        self.suspends = 0
+        self.unsuspends = 0
+        self.holds = 0
+        self.releases = 0
+        self.disconnects = 0
+        self.reconnects = 0
+        self.reconnect_fails = 0
+        self.file_transfer_start_count = 0
+        self.total_cpu_usage = None
+        self.bytes_sent = None
+        self.bytes_received = None
+        self.return_value = None
+        self.cpus_requested = None
+        self.cpus_allocated = None
+        self.cpus_used = None
+        self.disk_requested = None
+        self.disk_allocated = None
+        self.disk_used = None
+        self.memory_requested = None
+        self.memory_allocated = None
+        self.memory_used = None
+        self.image_size = None
+
+    def update_submit(self, event):
+        if self.submitted is None:
+            self.submitted = datetime.fromtimestamp(event.timestamp)
+        else:
+            print(f'Extra submit timestamp for job ID {self.job_id}', file=sys.stderr)
+
+    def add_execution(self, event):
+        self.execution_count += 1
+
+    # ['TerminatedNormally', 'ReceivedBytes', 'EventTypeNumber', 'Subproc', 'MyType', 'RunRemoteUsage',
+    # 'EventTime', 'Cluster', 'Proc', 'TerminatedAndRequeued', 'Checkpointed', 'RunLocalUsage', 'SentBytes']
+    def add_eviction(self, event):
+        self.eviction_count += 1
+
+    def add_termination(self, event):
+        self.termination_count += 1
+        if 'TerminatedNormally' in event:
+            if event['TerminatedNormally'] == True:
+                self.normal_terminations += 1
+            else:
+                self.abnormal_terminations += 1
+
+        total_remote_usage_string = event.get('TotalRemoteUsage')
+        usr_usage, sys_usage = total_remote_usage_string.split(', ')
+        self.total_cpu_usage = seconds_from_pre_dhhmmss(usr_usage) + seconds_from_pre_dhhmmss(sys_usage)
+        
+        self.bytes_sent = int(event.get('TotalSentBytes', 0))
+        self.bytes_received = int(event.get('TotalReceivedBytes', 0))
+        self.cpus_requested = event.get('RequestCpus')       # None is the default anyway
+        self.cpus_allocated = event.get('Cpus')              # None is the default anyway
+        self.cpus_used = event.get('CpusUsage')              # None is the default anyway
+        self.disk_requested = event.get('RequestDisk')       # None is the default anyway
+        self.disk_allocated = event.get('Disk')              # None is the default anyway
+        self.disk_used = event.get('DiskUsage')              # None is the default anyway
+        self.memory_requested = event.get('RequestMemory')   # None is the default anyway
+        self.memory_allocated = event.get('Memory')          # None is the default anyway
+        self.memory_used = event.get('MemoryUsage')          # None is the default anyway
+        self.return_value = event.get('ReturnValue')         # None is the default anyway
+
+        # Untouched:
+        #   - GPUs: "0"
+        #   - ToE: "{'ExitCode': 0, 'ExitBySignal': False, 'When': 1658080862, 'HowCode': 0, 'How': 'OF_ITS_OWN_ACCORD', 'Who': 'itself'}"
+
+    def update_image_size(self, event):
+        self.image_size = event.get('ResidentSetSize')   # None is the default anyway; last found should be greatest
+
+    def add_shadow_exception(self, event):
+        self.shadow_exceptions += 1
+
+    def add_abort(self, event):
+        self.aborts += 1
+
+    def add_suspend(self, event):
+        self.suspends += 1
+
+    def add_unsuspend(self, event):
+        self.unsuspends += 1
+
+    # TODO: Build something like NumHoldsByReason here.
+    # https://htcondor.readthedocs.io/en/latest/classad-attributes/job-classad-attributes.html#HoldReasonCode
+    def add_hold(self, event):
+        self.holds += 1
+
+    def add_release(self, event):
+        self.releases += 1
+
+    def add_disconnect(self, event):
+        self.disconnects += 1
+
+    def add_reconnect(self, event):
+        self.reconnects += 1
+
+    def add_reconnect_fail(self, event):
+        self.reconnect_fails += 1
+
+    def add_file_transfer(self, event):
+        ft_type = event.get('Type')
+        if (ft_type == htcondor.FileTransferEventType.IN_STARTED) or (ft_type == htcondor.FileTransferEventType.OUT_STARTED):
+            self.file_transfer_start_count += 1
+
+def dump_event_details(event):
+    """For investigating event attributes and debugging."""
+
+    print(event, end='', file=sys.stderr)
+    for key in sorted(event.keys()):
+        print(f'  - {key}: "{event[key]}"', file=sys.stderr)
+
+def seconds_from_pre_dhhmmss(duration_string):
+    """Extracts duration elements from a string like 'Usr 9 07:50:07' and returns seconds"""
+
+    match = re.match(r'\w+ (\d+) (\d{2}):(\d{2}):(\d{2})', duration_string)
+    if match:
+        days = match.group(1)
+        hours, minutes, seconds = [re.sub(r'^0', '', g) for g in match.groups()[1:]]
+        return (int(days) * 86400) + (int(hours) * 3600) + (int(minutes) * 60) + int(seconds)
+    else:
+        print(f'Could not parse termination event duration: "{duration_string}"', file=sys.stderr)
+
+def update_job_with_event(job, event):
+    """Updates the job with details from the event.
+
+    Examines the given event and routes it to the appropriate updater
+    method in the job object.  For the list of JobEventType values, see:
+    https://htcondor.readthedocs.io/en/latest/apis/python-bindings/api/htcondor.html#htcondor.JobEventType
+
+    Return None if the event was used to update the job, or 'suppressed' if the
+    event was skipped and should not be reported, or 'ignored' if the event was
+    skipped because that kind of event has not been checked for useful info.
+    """
+
+    if   event.type == htcondor.JobEventType.SUBMIT: job.update_submit(event)
+    elif event.type == htcondor.JobEventType.EXECUTE: job.add_execution(event)
+    elif event.type == htcondor.JobEventType.JOB_EVICTED: job.add_eviction(event)
+    elif event.type == htcondor.JobEventType.JOB_TERMINATED: job.add_termination(event)
+    elif event.type == htcondor.JobEventType.IMAGE_SIZE: job.update_image_size(event)
+    elif event.type == htcondor.JobEventType.SHADOW_EXCEPTION: job.add_shadow_exception(event)
+    elif event.type == htcondor.JobEventType.JOB_ABORTED: job.add_abort(event)
+    elif event.type == htcondor.JobEventType.JOB_SUSPENDED: job.add_suspend(event)
+    elif event.type == htcondor.JobEventType.JOB_UNSUSPENDED: job.add_unsuspend(event)
+    elif event.type == htcondor.JobEventType.JOB_HELD: job.add_hold(event)
+    elif event.type == htcondor.JobEventType.JOB_RELEASED: job.add_release(event)
+    elif event.type == htcondor.JobEventType.JOB_DISCONNECTED: job.add_disconnect(event)
+    elif event.type == htcondor.JobEventType.JOB_RECONNECTED: job.add_reconnect(event)
+    elif event.type == htcondor.JobEventType.JOB_RECONNECT_FAILED: job.add_reconnect_fail(event)
+    elif event.type == htcondor.JobEventType.FILE_TRANSFER: job.add_file_transfer(event)
+    else:
+        # In order: EXECUTABLE_ERROR, CHECKPOINTED, GENERIC, NODE_EXECUTE,
+        # NODE_TERMINATED, POST_SCRIPT_TERMINATED, GLOBUS_SUBMIT,
+        # GLOBUS_SUBMIT_FAILED, GLOBUS_RESOURCE_UP, GLOBUS_RESOURCE_DOWN,
+        # REMOTE_ERROR, GRID_RESOURCE_UP, GRID_RESOURCE_DOWN, GRID_SUBMIT,
+        # JOB_AD_INFORMATION, JOB_STATUS_UNKNOWN, JOB_STATUS_KNOWN, JOB_STAGE_IN,
+        # JOB_STAGE_OUT, ATTRIBUTE_UPDATE, PRESKIP, CLUSTER_SUBMIT,
+        # CLUSTER_REMOVE, FACTORY_PAUSED, FACTORY_RESUMED, NONE, RESERVE_SPACE,
+        # RELEASE_SPACE, FILE_COMPLETE, FILE_USED, FILE_REMOVED
+        return 'ignored'
+    return None
+
+def parse_args():
+    parser = argparse.ArgumentParser(description='Extract individual job data from job event logs and output as CSV.')
+    parser.add_argument('-d', '-di', '-dic', '-dict', nargs=0, help='print a data dictionary to stderr and exit', action=DataDictionaryAction)
+    parser.add_argument('-skipped', help='print skipped events to stderr', action='store_true')
+    parser.add_argument('logfile', nargs='+', help='job event log file(s)')
+    args = parser.parse_args()
+    return args
+
+def process_logs(event_log_list):
+    jobs = {}
+    skipped_events = {'suppressed': [], 'ignored': []}
+    for event_log_path in event_log_list:
+        try:
+            with htcondor.JobEventLog(event_log_path) as job_event_log:
+                for event in job_event_log.events(stop_after=0):
+                    job_id = f'{event.cluster}.{event.proc}'
+                    if job_id not in jobs:
+                        jobs[job_id] = JobInfo(job_id)
+                    skip_reason = update_job_with_event(jobs[job_id], event)
+                    if skip_reason is not None:
+                        skipped_events[skip_reason].append(event)
+        except htcondor.HTCondorIOError as e:
+            # The message within the exception instance is not particularly helpful, so it is not printed
+            print(f'Failed to read the log file at "{event_log_path}", so it was skipped.', file=sys.stderr)
+    return (jobs, skipped_events)
+
+def print_skipped_events(events):
+    # TODO: Print a table of number of events skipped by type
+    total_skipped_events = len(events['suppressed']) + len(events['ignored'])
+    print(f'Skipped events: {total_skipped_events}', file=sys.stderr)
+    # print(f'UNHANDLED EVENT ({event.type}): {event}', end='', file=sys.stderr)
+    # if print_skipped_event_details:
+    #     for key in sorted(event.keys()):
+    #         print(f'  - {key}: "{event[key]}"', file=sys.stderr)
+    # else:
+    #     print(event.keys(), file=sys.stderr)
+
+def print_csv(jobs):
+    if len(jobs) == 0:
+        print('No HTCondor events found, so there is no output.', file=sys.stderr)
+        return
+    csv_output = io.StringIO()
+    writer = csv.writer(csv_output)
+    writer.writerow(['JobId', 'Submitted', 'ExecCount', 'EvictCount', 'TermCount', 'TermNorm', 'TermAbnorm', 'ShdwExcpt',
+                     'Abrts', 'Suspnds', 'Unsus', 'Holds', 'Releases', 'Disconns', 'Reconns', 'RecFails',
+                     'FTStarts', 'UsageSum', 'ByteSent', 'ByteRcvd', 'RetVal',
+                     'CPUsReq', 'CPUsAlloc', 'CPUsUsed', 'DiskReq', 'DiskAlloc', 'DiskUsed', 'MemReq', 'MemAlloc', 'MemUsed', 'ImageSz'])
+    for job_id in sorted(jobs.keys()):
+        job = jobs[job_id]
+        csv_data = [job.job_id, job.submitted, job.execution_count, job.eviction_count,
+                    job.termination_count, job.normal_terminations, job.abnormal_terminations, job.shadow_exceptions,
+                    job.aborts, job.suspends, job.unsuspends, job.holds, job.releases,
+                    job.disconnects, job.reconnects, job.reconnect_fails,
+                    job.file_transfer_start_count, job.total_cpu_usage, job.bytes_sent, job.bytes_received, job.return_value,
+                    job.cpus_requested, job.cpus_allocated, job.cpus_used, job.disk_requested, job.disk_allocated, job.disk_used,
+                    job.memory_requested, job.memory_allocated, job.memory_used, job.image_size]
+        writer.writerow(csv_data)
+    print(csv_output.getvalue(), end='')
+
+def cli():
+    args = parse_args()   # Exits on -help or -dict options
+    jobs, skipped_events = process_logs(args.logfile)
+    if args.skipped:
+        print_skipped_events(skipped_events)
+    print_csv(jobs)
+
+if __name__ == "__main__":
+    cli()

@@ -4,4 +4,4 @@ A simple script that reads HTCondor job event logs and outputs a CSV summary of 
 
 This script depends on the HTCondor Python bindings to be installed and available.
 
-Run `log2csv -h` for usage information.
+Run `logs2csv -h` for usage information.
