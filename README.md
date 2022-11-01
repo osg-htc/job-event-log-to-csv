@@ -16,3 +16,12 @@ This script needs the following things:
 ## Usage
 
 Run `logs2csv -h` for usage information.
+
+## Notes
+
+<span style="color: #F60; font-weight: bold;">Note:</span>
+There is [a known bug in HTCondor](https://opensciencegrid.atlassian.net/browse/HTCONDOR-1263)
+that results in some values for a job’s requested disk being incorrect.
+In particular, if the amount of requested disk (in KB) exceeds 7 digits,
+the value is truncated **on the left**, which makes it look like much less disk was requested.
+So trust your submit files for the correct `request_disk` value!
