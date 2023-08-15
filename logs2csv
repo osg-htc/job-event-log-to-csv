@@ -5,6 +5,7 @@ from datetime import datetime, timedelta
 import argparse
 import csv
 import io
+import os
 import re
 import sys
 
@@ -16,6 +17,7 @@ class DataDictionaryAction(argparse.Action):
 CSV output column definitions:
 
 JobId      - Job ID, formatted as the Cluster ID, a ".", and the Process ID
+LogFile    - Job event log filename (without a path)
 Submitted  - Timestamp when the job was submitted
 ExecCount  - Count of job executions
 EvictCount - Count of job evictions
@@ -52,10 +54,11 @@ ImageSz    - Another measure of the maximum amount of memory (in MB) that HTCond
 class JobInfo:
     """Simple container for tallied data from a job."""
 
-    def __init__(self, job_id):
+    def __init__(self, job_id, log_filename):
         """Initialize a job object with sensible values."""
 
         self.job_id = job_id
+        self.log_filename = log_filename
         self.submitted = None
         self.execution_count = 0
         self.eviction_count = 0
@@ -238,10 +241,11 @@ def process_logs(event_log_list):
     for event_log_path in event_log_list:
         try:
             with htcondor.JobEventLog(event_log_path) as job_event_log:
+                event_log_basename = os.path.basename(event_log_path)
                 for event in job_event_log.events(stop_after=0):
                     job_id = f'{event.cluster}.{event.proc}'
                     if job_id not in jobs:
-                        jobs[job_id] = JobInfo(job_id)
+                        jobs[job_id] = JobInfo(job_id, event_log_basename)
                     skip_reason = update_job_with_event(jobs[job_id], event)
                     if skip_reason is not None:
                         skipped_events[skip_reason].append(event)
@@ -267,13 +271,14 @@ def print_csv(jobs):
         return
     csv_output = io.StringIO()
     writer = csv.writer(csv_output)
-    writer.writerow(['JobId', 'Submitted', 'ExecCount', 'EvictCount', 'TermCount', 'TermNorm', 'TermAbnorm', 'ShdwExcpt',
+    writer.writerow(['JobId', 'LogFile', 'Submitted', 'ExecCount', 'EvictCount',
+                     'TermCount', 'TermNorm', 'TermAbnorm', 'ShdwExcpt',
                      'Abrts', 'Suspnds', 'Unsus', 'Holds', 'Releases', 'Disconns', 'Reconns', 'RecFails',
                      'FTStarts', 'UsageSum', 'ByteSent', 'ByteRcvd', 'RetVal',
                      'CPUsReq', 'CPUsAlloc', 'CPUsUsed', 'DiskReq', 'DiskAlloc', 'DiskUsed', 'MemReq', 'MemAlloc', 'MemUsed', 'ImageSz'])
     for job_id in sorted(jobs.keys()):
         job = jobs[job_id]
-        csv_data = [job.job_id, job.submitted, job.execution_count, job.eviction_count,
+        csv_data = [job.job_id, job.log_filename, job.submitted, job.execution_count, job.eviction_count,
                     job.termination_count, job.normal_terminations, job.abnormal_terminations, job.shadow_exceptions,
                     job.aborts, job.suspends, job.unsuspends, job.holds, job.releases,
                     job.disconnects, job.reconnects, job.reconnect_fails,
